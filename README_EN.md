@@ -98,6 +98,33 @@ Visit `http://localhost:8080` — if you see `{"status":"running"}`, you're good
 
 > 💡 80+ parameters can be changed at runtime via the admin panel — no restart needed.
 
+### Importing existing memories
+
+Want to bring in memories from previous AI conversations? Two ways:
+
+**Option 1: Add via admin panel (recommended)**
+
+Open `/admin` → click 🧠 Memories in the sidebar → **+ Add Memory** in the top right → fill in title, content, and importance → Save.
+
+Best for a small number of memories. What you see is what you get.
+
+**Option 2: Bulk import (for lots of memories)**
+
+```bash
+# 1. Copy the example file
+cp seed_memories_example.py seed_memories.py
+
+# 2. Edit seed_memories.py — add your memories in this format:
+#    {"content": "User's favorite color is blue", "importance": 7}
+#    importance scale: 9-10 core identity / 7-8 important preferences / 5-6 interesting details
+
+# 3. Open your backend URL /import/seed-memories in a browser
+#    e.g. http://localhost:8080/import/seed-memories
+#    Duplicates are automatically skipped
+```
+
+Imported memories will appear in the admin panel's memory page.
+
 ---
 
 ## How it compares

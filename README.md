@@ -98,6 +98,33 @@ docker compose up -d
 
 > 💡 80+ 参数可在管理面板动态修改，无需重启。
 
+### 导入旧记忆
+
+想把以前和 AI 聊过的事情搬过来？两种方式：
+
+**方式一：管理面板手动添加（推荐）**
+
+打开管理面板 `/admin` → 点击左侧 🧠 记忆 → 右上角 **+ 添加记忆** → 填写标题、内容和重要度 → 保存。
+
+适合少量记忆，所见即所得。
+
+**方式二：批量导入（记忆多的时候用）**
+
+```bash
+# 1. 复制示例文件
+cp seed_memories_example.py seed_memories.py
+
+# 2. 编辑 seed_memories.py，按格式填入你的记忆
+#    每条格式：{"content": "记忆内容", "importance": 7}
+#    importance 评分：9-10 核心信息 / 7-8 重要偏好 / 5-6 有趣细节
+
+# 3. 浏览器访问后端地址 /import/seed-memories
+#    比如 http://localhost:8080/import/seed-memories
+#    自动导入，重复的会跳过
+```
+
+导入完成后在管理面板的记忆页面就能看到了。
+
 ---
 
 ## 和其他方案有什么不同

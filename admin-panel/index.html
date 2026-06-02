@@ -147,8 +147,35 @@ tailwind.config = {
       <div class="flex gap-2">
         <input type="text" id="mem-search" placeholder="搜索记忆…" class="w-64" onkeydown="if(event.key==='Enter')searchMemories()">
         <button class="btn btn-secondary" onclick="searchMemories()">搜索</button>
+        <button class="btn btn-primary" onclick="toggleAddMemory()">+ 添加记忆</button>
       </div>
     </div>
+
+    <!-- 添加记忆表单（折叠） -->
+    <div id="add-memory-form" class="bg-panel-card border border-panel-border rounded-lg p-5 mb-4 hidden">
+      <p class="section-title">添加记忆</p>
+      <div class="config-row">
+        <span class="config-label">标题（可选）</span>
+        <div class="config-value"><input type="text" id="new-mem-title" placeholder="给记忆起个标题…"></div>
+      </div>
+      <div class="config-row">
+        <span class="config-label">内容 *</span>
+        <div class="config-value"><textarea id="new-mem-content" rows="3" placeholder="写下你想让 AI 记住的事情…"></textarea></div>
+      </div>
+      <div class="config-row">
+        <span class="config-label">重要度</span>
+        <div class="config-value" style="display:flex; align-items:center; gap:12px;">
+          <input type="range" id="new-mem-importance" min="1" max="10" value="5" style="flex:1; accent-color:#4ade80;" oninput="document.getElementById('imp-display').textContent=this.value">
+          <span id="imp-display" style="min-width:24px; text-align:center; color:#4ade80; font-weight:600;">5</span>
+          <span class="text-xs text-gray-500">9-10 核心 · 7-8 重要 · 5-6 普通</span>
+        </div>
+      </div>
+      <div class="flex gap-2 mt-4">
+        <button class="btn btn-primary" onclick="submitNewMemory()">保存</button>
+        <button class="btn btn-secondary" onclick="toggleAddMemory()">取消</button>
+      </div>
+    </div>
+
     <div class="flex gap-2 mb-4">
       <select id="mem-sort" class="w-40" onchange="loadMemories()">
         <option value="recent">最近创建</option>
@@ -640,6 +667,34 @@ function renderMemories(memories, total) {
   } else {
     document.getElementById('mem-pagination').innerHTML = '';
   }
+}
+
+// ── 手动添加记忆 ──
+function toggleAddMemory() {
+  const form = document.getElementById('add-memory-form');
+  form.classList.toggle('hidden');
+  if (!form.classList.contains('hidden')) {
+    document.getElementById('new-mem-title').value = '';
+    document.getElementById('new-mem-content').value = '';
+    document.getElementById('new-mem-importance').value = 5;
+    document.getElementById('imp-display').textContent = '5';
+    document.getElementById('new-mem-content').focus();
+  }
+}
+
+async function submitNewMemory() {
+  const content = document.getElementById('new-mem-content').value.trim();
+  const title = document.getElementById('new-mem-title').value.trim();
+  const importance = parseInt(document.getElementById('new-mem-importance').value);
+  if (!content) { toast('❌ 内容不能为空', true); return; }
+  try {
+    const res = await api('/debug/memories', { method: 'POST', body: JSON.stringify({ content, title, importance }) });
+    const data = await res.json();
+    if (data.error) { toast('❌ ' + data.error, true); return; }
+    toast('✅ 记忆已添加');
+    toggleAddMemory();
+    loadMemories();
+  } catch(e) { toast('❌ 添加失败: ' + e.message, true); }
 }
 
 async function deleteMemory(id) {
