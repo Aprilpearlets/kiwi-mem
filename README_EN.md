@@ -22,6 +22,16 @@ Technically, it's a lightweight proxy gateway that sits between you and any LLM,
 
 ---
 
+## Why kiwi-mem exists
+
+Your AI's memories belong to you — not to a platform.
+
+kiwi-mem is built so that anyone can self-host, audit, and migrate their AI's long-term memory. No vendor lock-in, no black-box storage, no dependence on services that might disappear tomorrow.
+
+If an AI remembers you, you should be able to see what it remembers, decide what it keeps, and take it with you when you leave.
+
+---
+
 ## How memory works like a brain
 
 The core of kiwi-mem isn't any single feature — it's multiple mechanisms working in concert to make AI memory behave like human intuition:
