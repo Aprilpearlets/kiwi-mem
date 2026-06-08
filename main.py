@@ -404,8 +404,9 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
     
     try:
         # ---- ② 锁定记忆：全量注入（静态，很少变）----
+        # 全局对话：只拿全局锁定；项目对话：拿全局 + 当前项目锁定
         from database import get_permanent_memories
-        permanent = await get_permanent_memories()
+        permanent = await get_permanent_memories(project_id=project_id)
         if permanent:
             perm_lines = []
             for mem in permanent:
@@ -1355,6 +1356,14 @@ async def chat_completions(request: Request):
 
     if drawer_enabled:
         # ---- 抽屉模式：向量路由按需展开内部工具 + 外部 MCP 双轨 ----
+        # Lazy init：toggle 启动时为 false、运行时打开的场景下，lifespan 没跑过
+        # init_drawer，此时 CATEGORIES 为空会让 route_tools 返回 0 工具，叠加
+        # 下面的 `not drawer_enabled` 门控会让传统工具也消失。这里幂等调用兜底。
+        try:
+            from tool_drawer import init_drawer as _drawer_init
+            await _drawer_init()
+        except Exception as e:
+            print(f"⚠️ 工具抽屉 lazy init 失败: {e}")
         try:
             from tool_drawer import route_tools as _drawer_route
             user_embedding = prompt_meta.get("user_embedding") if prompt_meta else None
