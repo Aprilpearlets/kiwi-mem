@@ -174,6 +174,7 @@ async def init_tables():
                 api_base_url    TEXT NOT NULL,
                 api_key         TEXT DEFAULT '',
                 enabled         BOOLEAN DEFAULT TRUE,
+                api_format      TEXT DEFAULT 'openai',
                 created_at      TIMESTAMPTZ DEFAULT NOW(),
                 updated_at      TIMESTAMPTZ DEFAULT NOW()
             );
@@ -190,6 +191,7 @@ async def init_tables():
                 input_modes     TEXT DEFAULT 'text',
                 output_modes    TEXT DEFAULT 'text',
                 capabilities    TEXT DEFAULT '',
+                api_format      TEXT DEFAULT NULL,
                 created_at      TIMESTAMPTZ DEFAULT NOW(),
                 UNIQUE(provider_id, model_id)
             );
@@ -260,12 +262,15 @@ async def init_tables():
                 error           BOOLEAN DEFAULT FALSE,
                 token_info      JSONB,
                 thinking        TEXT,
+                status_events   JSONB,
                 tool_events     JSONB,
                 memory_result   JSONB,
                 memory_event    JSONB,
+                handoff_info    JSONB,
                 web_search_results JSONB,
                 versions        JSONB,
                 version_index   INTEGER DEFAULT 0,
+                images          JSONB,
                 attachments     JSONB,
                 usage           JSONB,
                 summary         TEXT,
@@ -450,6 +455,22 @@ async def init_tables():
             await conn.execute("ALTER TABLE chat_messages ADD COLUMN memory_event JSONB")
             print("✅ chat_messages 表已添加 memory_event 列")
 
+        # v6.1：chat_messages 表扩展 — 完整前端消息状态同步
+        for col_name, col_def in [
+            ("status_events", "JSONB"),
+            ("handoff_info", "JSONB"),
+            ("images", "JSONB"),
+        ]:
+            has_col = await conn.fetchval("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'chat_messages' AND column_name = $1
+                )
+            """, col_name)
+            if not has_col:
+                await conn.execute(f"ALTER TABLE chat_messages ADD COLUMN {col_name} {col_def}")
+                print(f"✅ chat_messages 表已添加 {col_name} 列（完整消息同步）")
+
         # v5.3：时间有效期窗口（MemPalace 启发）
         for col_name, col_def in [
             ("valid_from", "TIMESTAMPTZ DEFAULT NOW()"),
@@ -552,7 +573,29 @@ async def init_tables():
             await conn.execute("ALTER TABLE memories ADD COLUMN resolution FLOAT DEFAULT 1.0")
             print("✅ memories 表已添加 resolution 列（记忆软化系统）")
 
-    print("✅ 数据库表结构已就绪（v5.9 记忆软化）")
+        # v6.2：providers 表添加 api_format 列（openai / anthropic）
+        has_api_format = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'providers' AND column_name = 'api_format'
+            )
+        """)
+        if not has_api_format:
+            await conn.execute("ALTER TABLE providers ADD COLUMN api_format TEXT DEFAULT 'openai'")
+            print("✅ providers 表已添加 api_format 列（Anthropic 格式支持）")
+
+        # v6.2b：provider_models 表添加 api_format 列（模型级别覆盖供应商默认值）
+        has_model_api_format = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'provider_models' AND column_name = 'api_format'
+            )
+        """)
+        if not has_model_api_format:
+            await conn.execute("ALTER TABLE provider_models ADD COLUMN api_format TEXT DEFAULT NULL")
+            print("✅ provider_models 表已添加 api_format 列（模型级覆盖）")
+
+    print("✅ 数据库表结构已就绪（v6.2b 模型级 API 格式支持）")
 
 
 # ============================================================
@@ -815,23 +858,27 @@ async def get_recent_conversation(limit: int = 20):
         return list(reversed(rows))
 
 
-async def get_handoff_messages(limit: int = 6):
+async def get_handoff_messages(limit: int = 6, exclude_conversation_id: str = None):
     """
     获取最近一个有足够消息的对话的最后 N 条消息，用于无缝切窗。
     只取 user 和 assistant 角色的消息，按时间正序返回。
+
+    exclude_conversation_id: 当前正在进行的对话 ID。如果传入，会跳过它，
+    避免在同一个对话里继续聊时把自己的最后几条又当成"上一个对话"注入。
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # 找最近一个至少有 4 条消息（2 轮来回）的对话
+        # 找最近一个至少有 4 条消息（2 轮来回）的对话，排除当前对话本身
         conv = await conn.fetchrow("""
             SELECT c.id, c.title FROM chat_conversations c
-            WHERE (
-                SELECT COUNT(*) FROM chat_messages m 
+            WHERE ($1::text IS NULL OR c.id <> $1)
+              AND (
+                SELECT COUNT(*) FROM chat_messages m
                 WHERE m.conversation_id = c.id AND m.role IN ('user', 'assistant')
             ) >= 4
             ORDER BY c.updated_at DESC
             LIMIT 1
-        """)
+        """, exclude_conversation_id)
         if not conv:
             return [], ""
         
@@ -972,21 +1019,23 @@ async def update_memory(memory_id: int, content: str = None, importance: int = N
 # 记忆搜索（v3.0 向量语义搜索）
 # ============================================================
 
-async def search_memories(query: str, limit: int = 10, track_recall: bool = True, project_id: str = None):
+async def search_memories(query: str, limit: int = 10, track_recall: bool = True, project_id: str = None, return_embedding: bool = False):
     """
     搜索相关记忆 —— RRF 混合检索（v5.7）
-    
+
     流程：
     1. 生成查询向量
     2. 并行执行向量搜索 + 关键词搜索
     3. RRF（Reciprocal Rank Fusion）合并两路结果
     4. 更新召回追踪数据（可关闭）
     5. 返回 top-K
-    
+
     参数：
         track_recall: 是否记录召回追踪数据。聊天注入时=True，去重对比时=False
         project_id: 项目ID。提供时搜索全局记忆+该项目记忆；不提供时只搜全局记忆
-    
+        return_embedding: True 时返回 (results, query_embedding) 元组，
+                          调用方可复用 embedding 避免重复计算（如工具抽屉路由）
+
     降级：如果 embedding 生成失败，只用关键词搜索
     """
     # 候选池扩大到 3 倍，给 RRF 合并留充足的候选
@@ -1075,7 +1124,11 @@ async def search_memories(query: str, limit: int = 10, track_recall: bool = True
             await _check_auto_lock(ids, heat_params)
         except Exception as e:
             print(f"   ⚠️ 自动锁定检测出错（不影响搜索）: {e}")
-    
+
+    # v6.0：可选返回 query_embedding（供工具抽屉路由复用）
+    if return_embedding:
+        return results, query_embedding
+
     return results
 
 
@@ -1174,6 +1227,7 @@ async def _vector_search(query_embedding: list, limit: int, heat_params: dict, p
             "is_permanent": row.get("is_permanent", False),
             "emotional_weight": row.get("emotional_weight", 0),
             "resolution": row.get("resolution", 1.0),
+            "project_id": row.get("project_id"),
             "heat": round(heat, 4),
             "similarity": round(sim, 4),
             "score": round(score, 4),
@@ -1564,6 +1618,7 @@ async def _keyword_search(query: str, limit: int = 10, heat_params: dict = None,
                 COALESCE(m.access_query_hashes, '[]'::jsonb) as access_query_hashes,
                 COALESCE(m.is_permanent, false) as is_permanent,
                 COALESCE(m.resolution, 1.0) as resolution,
+                m.project_id,
                 ({hit_count_expr}) AS hit_count,
                 (
                     0.5 * ({hit_count_expr})::float / {max_hits} +
@@ -1598,6 +1653,7 @@ async def _keyword_search(query: str, limit: int = 10, heat_params: dict = None,
                 "is_permanent": r.get("is_permanent", False),
                 "emotional_weight": r.get("emotional_weight", 0),
                 "resolution": r.get("resolution", 1.0),
+                "project_id": r.get("project_id"),
                 "heat": round(heat, 4),
                 "similarity": 0.0,
                 "score": round(float(r["score"]), 4),
@@ -1654,38 +1710,46 @@ async def get_all_memories_count():
 # 记忆去重检测
 # ============================================================
 
-async def check_memory_duplicate(new_content: str, threshold: float = None, new_title: str = ""):
+async def check_memory_duplicate(new_content: str, threshold: float = None, new_title: str = "", project_id: str = None):
     """
     检查新记忆是否与已有记忆重复（v5.4：标题不同时不判重复）
-    
+
     三层检测：
     1. 精确匹配
     2. 包含关系
     3. 字符重叠度 + 标题保护（标题明显不同 → 不同主题 → 放行）
-    
+
+    project_id: 传入时只在该项目内去重；不传时只在全局（project_id IS NULL）去重
+
     返回：(is_duplicate: bool, similar_results: list)
-    
+
     注意：去重仍用字符级检测（而非向量），因为去重需要精确判断，
     而向量搜索更适合"模糊相关"的场景。
     """
     if threshold is None:
         threshold = DEDUP_THRESHOLD
-    
+
     pool = await get_pool()
-    
-    # 第1层：精确匹配
+
+    # 第1层：精确匹配（按作用域过滤）
     async with pool.acquire() as conn:
-        exact_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM memories WHERE content = $1",
-            new_content,
-        )
+        if project_id:
+            exact_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM memories WHERE content = $1 AND project_id = $2",
+                new_content, project_id,
+            )
+        else:
+            exact_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM memories WHERE content = $1 AND project_id IS NULL",
+                new_content,
+            )
         if exact_count > 0:
             print(f"🔄 精确重复，跳过: {new_content[:60]}...")
             return True, []
-    
+
     # 第2层 + 第3层：先用向量搜索找候选，再做精确对比
     try:
-        similar = await search_memories(new_content, limit=15, track_recall=False)
+        similar = await search_memories(new_content, limit=15, track_recall=False, project_id=project_id)
     except Exception:
         return False, []
     
@@ -1820,7 +1884,7 @@ async def get_all_providers():
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT id, name, api_base_url, api_key, enabled, created_at, updated_at
+            SELECT id, name, api_base_url, api_key, api_format, enabled, created_at, updated_at
             FROM providers ORDER BY created_at ASC
         """)
         return [dict(r) for r in rows]
@@ -1831,28 +1895,28 @@ async def get_provider(provider_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            SELECT id, name, api_base_url, api_key, enabled, created_at, updated_at
+            SELECT id, name, api_base_url, api_key, api_format, enabled, created_at, updated_at
             FROM providers WHERE id = $1
         """, provider_id)
         return dict(row) if row else None
 
 
-async def create_provider(name: str, api_base_url: str, api_key: str = '', enabled: bool = True):
+async def create_provider(name: str, api_base_url: str, api_key: str = '', enabled: bool = True, api_format: str = 'openai'):
     """创建供应商"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            INSERT INTO providers (name, api_base_url, api_key, enabled)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id, name, api_base_url, api_key, enabled, created_at, updated_at
-        """, name, api_base_url, api_key, enabled)
+            INSERT INTO providers (name, api_base_url, api_key, enabled, api_format)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id, name, api_base_url, api_key, api_format, enabled, created_at, updated_at
+        """, name, api_base_url, api_key, enabled, api_format)
         return dict(row)
 
 
 async def update_provider(provider_id: int, **kwargs):
     """更新供应商"""
     pool = await get_pool()
-    allowed = {'name', 'api_base_url', 'api_key', 'enabled'}
+    allowed = {'name', 'api_base_url', 'api_key', 'enabled', 'api_format'}
     fields = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
     if not fields:
         return None
@@ -1868,7 +1932,7 @@ async def update_provider(provider_id: int, **kwargs):
     query = f"""
         UPDATE providers SET {', '.join(sets)}
         WHERE id = ${len(vals)}
-        RETURNING id, name, api_base_url, api_key, enabled, created_at, updated_at
+        RETURNING id, name, api_base_url, api_key, api_format, enabled, created_at, updated_at
     """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(query, *vals)
@@ -1895,7 +1959,7 @@ async def get_provider_models(provider_id: int):
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, provider_id, model_id, display_name, model_type,
-                   input_modes, output_modes, capabilities, created_at
+                   input_modes, output_modes, capabilities, api_format, created_at
             FROM provider_models WHERE provider_id = $1
             ORDER BY created_at ASC
         """, provider_id)
@@ -1908,7 +1972,7 @@ async def get_all_saved_models():
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT pm.id, pm.provider_id, pm.model_id, pm.display_name, pm.model_type,
-                   pm.input_modes, pm.output_modes, pm.capabilities, pm.created_at,
+                   pm.input_modes, pm.output_modes, pm.capabilities, pm.api_format, pm.created_at,
                    p.name as provider_name
             FROM provider_models pm
             JOIN providers p ON pm.provider_id = p.id
@@ -1919,27 +1983,31 @@ async def get_all_saved_models():
 
 async def add_provider_model(provider_id: int, model_id: str, display_name: str = '',
                              model_type: str = 'chat', input_modes: str = 'text',
-                             output_modes: str = 'text', capabilities: str = ''):
+                             output_modes: str = 'text', capabilities: str = '', api_format: str = None):
     """添加模型到供应商"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
             INSERT INTO provider_models (provider_id, model_id, display_name, model_type,
-                                         input_modes, output_modes, capabilities)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                         input_modes, output_modes, capabilities, api_format)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (provider_id, model_id) DO NOTHING
             RETURNING id, provider_id, model_id, display_name, model_type,
-                      input_modes, output_modes, capabilities, created_at
+                      input_modes, output_modes, capabilities, api_format, created_at
         """, provider_id, model_id, display_name or model_id, model_type,
-             input_modes, output_modes, capabilities)
+             input_modes, output_modes, capabilities, api_format or None)
         return dict(row) if row else None
 
 
 async def update_provider_model(model_pk_id: int, **kwargs):
     """更新模型配置"""
     pool = await get_pool()
-    allowed = {'display_name', 'model_type', 'input_modes', 'output_modes', 'capabilities'}
-    fields = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+    allowed = {'display_name', 'model_type', 'input_modes', 'output_modes', 'capabilities', 'api_format'}
+    fields = {k: v for k, v in kwargs.items() if k in allowed}
+    # api_format 允许设为 None/空串（表示跟随供应商）
+    if 'api_format' in fields:
+        fields['api_format'] = fields['api_format'] or None
+    fields = {k: v for k, v in fields.items() if v is not None or k == 'api_format'}
     if not fields:
         return None
 
@@ -1954,7 +2022,7 @@ async def update_provider_model(model_pk_id: int, **kwargs):
         UPDATE provider_models SET {', '.join(sets)}
         WHERE id = ${len(vals)}
         RETURNING id, provider_id, model_id, display_name, model_type,
-                  input_modes, output_modes, capabilities, created_at
+                  input_modes, output_modes, capabilities, api_format, created_at
     """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(query, *vals)
@@ -1972,11 +2040,16 @@ async def delete_provider_model(model_pk_id: int):
 
 
 async def resolve_provider_for_model(model_id: str):
-    """根据 model_id 查找对应的已启用供应商，返回 {api_base_url, api_key, provider_name} 或 None"""
+    """根据 model_id 查找对应的已启用供应商，返回 {api_base_url, api_key, api_format, provider_name} 或 None
+
+    api_format 优先级：模型级 > 供应商级 > 默认 'openai'
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            SELECT p.api_base_url, p.api_key, p.name as provider_name
+            SELECT p.api_base_url, p.api_key,
+                   COALESCE(pm.api_format, p.api_format, 'openai') as api_format,
+                   p.name as provider_name
             FROM provider_models pm
             JOIN providers p ON pm.provider_id = p.id
             WHERE pm.model_id = $1 AND p.enabled = TRUE
@@ -2186,14 +2259,14 @@ async def sync_upsert_messages(conv_id: str, messages: list):
                 await conn.execute("""
                     INSERT INTO chat_messages (
                         id, conversation_id, role, content, time, model,
-                        streaming, error, token_info, thinking, tool_events,
-                        memory_result, memory_event, web_search_results, versions, version_index,
-                        attachments, usage, summary, sort_order
+                        streaming, error, token_info, thinking, status_events, tool_events,
+                        memory_result, memory_event, handoff_info, web_search_results, versions, version_index,
+                        images, attachments, usage, summary, sort_order
                     ) VALUES (
                         $1, $2, $3, $4, $5, $6,
-                        $7, $8, $9, $10, $11,
-                        $12, $13, $14, $15, $16,
-                        $17, $18, $19, $20
+                        $7, $8, $9, $10, $11, $12,
+                        $13, $14, $15, $16, $17, $18,
+                        $19, $20, $21, $22, $23
                     )
                 """,
                     str(msg.get("id") or f"m-{conv_id}-{idx}"),
@@ -2206,12 +2279,15 @@ async def sync_upsert_messages(conv_id: str, messages: list):
                     bool(msg.get("error", False)),
                     _to_json(msg.get("tokenInfo") or msg.get("token_info")),
                     msg.get("thinking") if isinstance(msg.get("thinking"), str) else None,
+                    _to_json(msg.get("statusEvents") or msg.get("status_events")),
                     _to_json(msg.get("toolEvents") or msg.get("tool_events")),
                     _to_json(msg.get("memoryResult") or msg.get("memory_result")),
                     _to_json(msg.get("memoryEvent") or msg.get("memory_event")),
+                    _to_json(msg.get("handoffInfo") or msg.get("handoff_info")),
                     _to_json(msg.get("webSearchResults") or msg.get("web_search_results")),
                     _to_json(msg.get("versions")),
                     int(msg.get("versionIndex", msg.get("version_index", 0)) or 0),
+                    _to_json(msg.get("images")),
                     _to_json(msg.get("attachments")),
                     _to_json(msg.get("usage")),
                     msg.get("summary") if isinstance(msg.get("summary"), str) else None,

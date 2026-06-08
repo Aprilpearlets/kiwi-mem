@@ -48,6 +48,10 @@ from memory_extractor import extract_memories
 from mcp_server import get_mcp_app, get_calendar_mcp_app, mcp_memory, mcp_calendar
 from web_search import web_search, format_results_for_prompt, get_engine_list
 from mcp_client import get_tools_for_servers, run_tool_call_loop, call_tool, call_tools_batch, clear_tool_cache
+from anthropic_adapter import (
+    to_anthropic_request, to_anthropic_headers, get_anthropic_url,
+    from_anthropic_response, anthropic_stream_to_openai,
+)
 
 # ============================================================
 # 配置项 —— 全部从环境变量读取，部署时在云平台面板里设置
@@ -351,7 +355,7 @@ def replace_template_variables(text: str, context: dict = None) -> str:
 # 记忆注入
 # ============================================================
 
-async def build_system_prompt_with_memories(user_message: str, user_msg_count: int = 1, project_id: str = None) -> tuple:
+async def build_system_prompt_with_memories(user_message: str, user_msg_count: int = 1, project_id: str = None, conversation_id: str = None) -> tuple:
     """
     构建带记忆的 system prompt（v5.5 日历层级注入 + v5.8 项目注入 + 缓存优化）
     
@@ -529,7 +533,7 @@ async def build_system_prompt_with_memories(user_message: str, user_msg_count: i
             if handoff_on and user_msg_count <= handoff_stop:
                 from database import get_handoff_messages
                 handoff_count = await get_config_int("handoff_msg_count", fallback=6)
-                handoff_msgs, prev_title = await get_handoff_messages(limit=handoff_count)
+                handoff_msgs, prev_title = await get_handoff_messages(limit=handoff_count, exclude_conversation_id=conversation_id)
                 if handoff_msgs:
                     title_hint = f"（上一个对话：{prev_title}）" if prev_title else ""
                     prompt_meta["handoff"] = {"title": prev_title or "", "count": len(handoff_msgs)}
@@ -689,6 +693,12 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
                     print(f"   🌙 Dream 异常: {e}")
             _spawn_background_task(_silent_dream())
 
+        # 项目对话默认不提取碎片（对话已保存，但不走记忆提取流程）
+        # 未来做"碎片进全局"开关后，这里加条件判断
+        if project_id:
+            print(f"📂 项目对话，跳过记忆提取（project_id={project_id}）")
+            return {"action": "skip_project", "project_id": project_id}
+
         # 检测用户是否主动要求记忆
         force_extract = any(kw in user_msg for kw in MEMORY_TRIGGER_WORDS)
 
@@ -788,26 +798,33 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
         saved_count = 0
         skipped_count = 0
         contradiction_count = 0
-        
+        saved_items = []  # 收集保存的记忆内容（供事件 payload 使用）
+
         for mem in filtered_memories:
-            # 去重检测（v5.4：传标题，标题不同时不误杀）
-            is_dup, similar_results = await check_memory_duplicate(mem["content"], new_title=mem.get("title", ""))
-            
+            # 去重检测（v5.4：传标题，标题不同时不误杀；v5.8：按 project_id 作用域去重）
+            is_dup, similar_results = await check_memory_duplicate(mem["content"], new_title=mem.get("title", ""), project_id=project_id)
+
             if is_dup:
                 skipped_count += 1
                 continue
-            
+
+            # 按作用域过滤矛盾候选：项目碎片只能替代同项目的旧碎片，全局只看全局
+            if project_id:
+                scoped_results = [m for m in similar_results if m.get("project_id") == project_id]
+            else:
+                scoped_results = [m for m in similar_results if m.get("project_id") is None]
+
             # 矛盾检测（v5.3：复用去重搜索结果，不额外调 embedding API）
             contradicted_ids = detect_contradictions(
-                mem.get("title", ""), mem["content"], similar_results
+                mem.get("title", ""), mem["content"], scoped_results
             )
-            
+
             # 自动匹配分类
             cat_id = None
             cat_hint = mem.get("category", "")
             if cat_hint:
                 cat_id = await match_category_by_name(cat_hint)
-            
+
             # 保存新记忆（v5.3：返回 ID，用于创建 supersedes edge）
             new_id = await save_memory(
                 content=mem["content"],
@@ -820,7 +837,8 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
                 project_id=project_id,
             )
             saved_count += 1
-            
+            saved_items.append({"title": mem.get("title", ""), "content": mem["content"][:120]})
+
             # 处理矛盾：标旧记忆失效 + 创建 supersedes edge
             if contradicted_ids and new_id:
                 for old_id in contradicted_ids:
@@ -830,15 +848,15 @@ async def process_memories_background(session_id: str, user_msg: str, assistant_
                         reason="提取时自动检测到信息更新", created_by="extractor"
                     )
                     contradiction_count += 1
-        
+
         if saved_count > 0 or skipped_count > 0:
             total = await get_all_memories_count()
             contra_msg = f"，{contradiction_count} 条旧记忆被替代" if contradiction_count > 0 else ""
             print(f"💾 提取结果：{saved_count} 条新记忆已保存，{skipped_count} 条重复已跳过{contra_msg}，总计 {total} 条")
-            return {"action": "extract", "saved": saved_count, "skipped": skipped_count, "contradictions": contradiction_count, "total": total}
+            return {"action": "extract", "saved": saved_count, "skipped": skipped_count, "contradictions": contradiction_count, "total": total, "items": saved_items}
         else:
             print(f"💭 本轮对话未产生新记忆")
-            return {"action": "extract", "saved": 0, "skipped": 0, "contradictions": 0, "total": await get_all_memories_count()}
+            return {"action": "extract", "saved": 0, "skipped": 0, "contradictions": 0, "total": await get_all_memories_count(), "items": []}
             
     except Exception as e:
         print(f"⚠️  后台记忆处理失败: {e}")
@@ -1100,6 +1118,8 @@ async def chat_completions(request: Request):
     
     # v5.8：项目 ID（前端传来，用于项目指令/记忆/文件注入）
     project_id = body.pop('project_id', None) or None
+    # v6.0：前端对话 ID，用于无缝换窗时避免衔接到当前对话自身
+    conversation_id = body.pop('conversation_id', None) or None
 
     # 先确定最终模型，后面的 prompt cache 判断要用它。
     # 如果客户端没传 model，这里会补上默认值，避免误判为“非 Claude”而跳过缓存。
@@ -1114,7 +1134,7 @@ async def chat_completions(request: Request):
         # v5.6：计算用户消息数（用于无缝切窗判断是第几轮）
         user_msg_count = sum(1 for m in messages if m.get('role') == 'user')
         if mem_enabled and user_message:
-            enhanced_prompt, prompt_meta = await build_system_prompt_with_memories(user_message, user_msg_count=user_msg_count, project_id=project_id)
+            enhanced_prompt, prompt_meta = await build_system_prompt_with_memories(user_message, user_msg_count=user_msg_count, project_id=project_id, conversation_id=conversation_id)
         else:
             # v5.4：即使记忆关闭，也从数据库优先读取 system prompt（降级到文件版本）
             enhanced_prompt = await get_active_system_prompt() or SYSTEM_PROMPT
@@ -1224,12 +1244,18 @@ async def chat_completions(request: Request):
         provider_info = await resolve_provider_for_model(model)
     except Exception:
         provider_info = None
+
+    api_format = "openai"  # 默认 OpenAI 格式
     if provider_info:
         chat_api_key = provider_info["api_key"]
-        # 确保 URL 以 /chat/completions 结尾
+        api_format = provider_info.get("api_format", "openai") or "openai"
         base = provider_info["api_base_url"].rstrip("/")
-        chat_api_url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
-        print(f"🔀 路由到供应商 [{provider_info['provider_name']}]: {base}")
+        if api_format == "anthropic":
+            chat_api_url = get_anthropic_url(base)
+            print(f"🔀 路由到供应商 [{provider_info['provider_name']}] (Anthropic 格式): {chat_api_url}")
+        else:
+            chat_api_url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+            print(f"🔀 路由到供应商 [{provider_info['provider_name']}]: {base}")
     else:
         chat_api_key = API_KEY
         chat_api_url = API_BASE_URL
@@ -1268,13 +1294,16 @@ async def chat_completions(request: Request):
             print(f"🔀 Provider 偏好：优先 Anthropic 直连")
 
     # ---------- 转发请求 ----------
-    headers = {
-        "Authorization": f"Bearer {chat_api_key}",
-        "Content-Type": "application/json",
-    }
-    if "openrouter" in chat_api_url:
-        headers["HTTP-Referer"] = EXTRA_REFERER
-        headers["X-Title"] = EXTRA_TITLE
+    if api_format == "anthropic":
+        headers = to_anthropic_headers(chat_api_key)
+    else:
+        headers = {
+            "Authorization": f"Bearer {chat_api_key}",
+            "Content-Type": "application/json",
+        }
+        if "openrouter" in chat_api_url:
+            headers["HTTP-Referer"] = EXTRA_REFERER
+            headers["X-Title"] = EXTRA_TITLE
     
     is_stream = body.get("stream", False)
     
@@ -1441,6 +1470,7 @@ async def chat_completions(request: Request):
                 api_key=chat_api_key,
                 project_id=project_id,
                 prompt_meta=prompt_meta,
+                api_format=api_format,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
@@ -1449,16 +1479,21 @@ async def chat_completions(request: Request):
     # ========== 正常转发模式 ==========
     if is_stream:
         return StreamingResponse(
-            stream_and_capture(headers, body, session_id, user_message, model, tool_events, api_url=chat_api_url, project_id=project_id, prompt_meta=prompt_meta),
+            stream_and_capture(headers, body, session_id, user_message, model, tool_events, api_url=chat_api_url, project_id=project_id, prompt_meta=prompt_meta, api_format=api_format, api_key=chat_api_key),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
         )
     else:
+        # 非流式：Anthropic 格式需要转换请求和响应
+        send_body = to_anthropic_request(body) if api_format == "anthropic" else body
         async with httpx.AsyncClient(timeout=300) as client:
-            response = await client.post(chat_api_url, headers=headers, json=body)
-            
+            response = await client.post(chat_api_url, headers=headers, json=send_body)
+
             if response.status_code == 200:
                 resp_data = response.json()
+                # Anthropic 响应转回 OpenAI 格式
+                if api_format == "anthropic":
+                    resp_data = from_anthropic_response(resp_data, model)
                 assistant_msg = ""
                 try:
                     assistant_msg = resp_data["choices"][0]["message"]["content"]
@@ -1657,7 +1692,7 @@ async def _execute_gateway_tool(tool_name: str, arguments: dict, tool_info: dict
     return f"未知的内置工具: {tool_name}", extra
 
 
-async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool_events, session_id, user_message, mem_enabled, api_url=None, api_key=None, project_id=None, prompt_meta=None):
+async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool_events, session_id, user_message, mem_enabled, api_url=None, api_key=None, project_id=None, prompt_meta=None, api_format="openai"):
     """
     工具 + 流式模式：tool call 轮次用非流式（需要完整看 tool_calls），
     最终回复直接输出已获得的内容（模拟流式），不再重复请求 LLM。
@@ -1676,13 +1711,16 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
     for evt in (tool_events or []):
         yield f"data: {json.dumps({'ev_tool': evt}, ensure_ascii=False)}\n\n"
 
-    headers = {
-        "Authorization": f"Bearer {_api_key}",
-        "Content-Type": "application/json",
-    }
-    if "openrouter" in _api_url:
-        headers["HTTP-Referer"] = EXTRA_REFERER
-        headers["X-Title"] = EXTRA_TITLE
+    if api_format == "anthropic":
+        headers = to_anthropic_headers(_api_key)
+    else:
+        headers = {
+            "Authorization": f"Bearer {_api_key}",
+            "Content-Type": "application/json",
+        }
+        if "openrouter" in _api_url:
+            headers["HTTP-Referer"] = EXTRA_REFERER
+            headers["X-Title"] = EXTRA_TITLE
 
     current_messages = list(messages)
     max_rounds = 10
@@ -1698,19 +1736,26 @@ async def _stream_with_tools(messages, tools, tool_map, model, temperature, tool
             "stream": False,
         }
         # OpenRouter：非流式也启用思考链，这样最终回复直接输出时不丢思考内容
-        if "openrouter" in _api_url:
+        # （Anthropic 直连不需要这个 OpenRouter 私有字段）
+        if api_format == "openai" and "openrouter" in _api_url:
             body["reasoning"] = {"enabled": True}
 
-        print(f"🔄 Tool loop round {round_num + 1}: {len(tools)} tools, {len(current_messages)} msgs")
+        # Anthropic 格式转换
+        send_body = to_anthropic_request(body) if api_format == "anthropic" else body
+
+        print(f"🔄 Tool loop round {round_num + 1}: {len(tools)} tools, {len(current_messages)} msgs (format={api_format})")
 
         async with _httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(_api_url, headers=headers, json=body)
+            resp = await client.post(_api_url, headers=headers, json=send_body)
             if resp.status_code != 200:
                 print(f"❌ LLM 请求失败: {resp.status_code}")
                 yield f"data: {json.dumps({'choices': [{'delta': {'content': f'⚠️ 模型请求失败 ({resp.status_code})'}, 'finish_reason': None}], 'model': model}, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
                 return
             data = resp.json()
+            # Anthropic 响应转回 OpenAI 格式
+            if api_format == "anthropic":
+                data = from_anthropic_response(data, model)
 
         choice = data.get("choices", [{}])[0]
         message = choice.get("message", {})
@@ -1875,72 +1920,112 @@ def _estimate_tokens(text: str) -> int:
     return max(1, round(cjk / 1.5 + other / 4))
 
 
-async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, tool_events: list = None, api_url: str = None, project_id: str = None, prompt_meta: dict = None):
+async def stream_and_capture(headers: dict, body: dict, session_id: str, user_message: str, model: str, tool_events: list = None, api_url: str = None, project_id: str = None, prompt_meta: dict = None, api_format: str = "openai", api_key: str = None):
     """流式响应 + 捕获完整回复 + 工具事件"""
     _api_url = api_url or API_BASE_URL
-    
+
     # 先发送衔接提示（如果有无缝切窗）
     if prompt_meta and prompt_meta.get("handoff"):
         yield f"data: {json.dumps({'ev_handoff': prompt_meta['handoff']}, ensure_ascii=False)}\n\n".encode("utf-8")
-    
+
     # 先发送工具事件
     for evt in (tool_events or []):
         yield f"data: {json.dumps({'ev_tool': evt}, ensure_ascii=False)}\n\n".encode("utf-8")
-    
+
     full_response = []
-    buffer = ""
     _logged_first_delta = False
     _reasoning_chunks = 0
-    
-    async with httpx.AsyncClient(timeout=300) as client:
-        async with client.stream("POST", _api_url, headers=headers, json=body) as response:
-            if response.status_code != 200:
-                error_body = b""
-                async for chunk in response.aiter_bytes():
-                    error_body += chunk
-                print(f"❌ 流式请求失败 [{response.status_code}]: {error_body[:500].decode('utf-8', errors='ignore')}")
-                err_msg = f"⚠️ 请求失败 ({response.status_code})"
-                err_payload = json.dumps({'choices': [{'delta': {'content': err_msg}, 'finish_reason': None}], 'model': model}, ensure_ascii=False)
-                yield f"data: {err_payload}\n\n".encode("utf-8")
-                yield b"data: [DONE]\n\n"
-                return
-            
-            async for chunk in response.aiter_bytes():
-                yield chunk
-                try:
-                    buffer += chunk.decode("utf-8", errors="ignore")
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        line = line.strip()
-                        if line.startswith("data: ") and line != "data: [DONE]":
-                            try:
+
+    # Anthropic 格式：转换请求体，使用流式适配器
+    if api_format == "anthropic":
+        send_body = to_anthropic_request(body)
+        send_body["stream"] = True
+        _headers = to_anthropic_headers(api_key or API_KEY)
+        _headers["Accept-Encoding"] = "identity"
+
+        async with httpx.AsyncClient(timeout=300) as client:
+            async with client.stream("POST", _api_url, headers=_headers, json=send_body) as response:
+                if response.status_code != 200:
+                    error_body = b""
+                    async for chunk in response.aiter_bytes():
+                        error_body += chunk
+                    print(f"❌ Anthropic 流式请求失败 [{response.status_code}]: {error_body[:500].decode('utf-8', errors='ignore')}")
+                    err_msg = f"⚠️ 请求失败 ({response.status_code})"
+                    err_payload = json.dumps({'choices': [{'delta': {'content': err_msg}, 'finish_reason': None}], 'model': model}, ensure_ascii=False)
+                    yield f"data: {err_payload}\n\n".encode("utf-8")
+                    yield b"data: [DONE]\n\n"
+                    return
+
+                # 使用适配器将 Anthropic SSE 转换为 OpenAI SSE
+                async for openai_chunk in anthropic_stream_to_openai(response, model):
+                    yield openai_chunk
+                    # 捕获正文内容（用于后续记忆提取）
+                    try:
+                        decoded = openai_chunk.decode("utf-8", errors="ignore")
+                        for line in decoded.strip().split("\n"):
+                            line = line.strip()
+                            if line.startswith("data: ") and line != "data: [DONE]":
                                 data = json.loads(line[6:])
                                 delta = data.get("choices", [{}])[0].get("delta", {})
-                                
-                                # 🔍 调试日志：记录第一个有效delta的所有字段
-                                if not _logged_first_delta and delta:
-                                    keys = list(delta.keys())
-                                    if keys and keys != ['role']:
-                                        print(f"🔍 [流式调试] 首个delta字段: {keys}, 模型: {model}")
-                                        # 如果有思考链相关字段，打印示例
-                                        for k in ('reasoning_content', 'reasoning', 'reasoning_details'):
-                                            if k in delta:
-                                                sample = str(delta[k])[:100]
-                                                print(f"🔍 [流式调试] {k} 示例: {sample}")
-                                        _logged_first_delta = True
-                                
-                                # 统计思考链 chunk 数
-                                if delta.get('reasoning_content') or delta.get('reasoning') or delta.get('reasoning_details'):
-                                    _reasoning_chunks += 1
-                                
                                 content = delta.get("content", "")
                                 if content:
                                     full_response.append(content)
-                            except (json.JSONDecodeError, KeyError, IndexError):
-                                pass
-                except Exception:
-                    pass
-    
+                                if delta.get("reasoning_content"):
+                                    _reasoning_chunks += 1
+                    except Exception:
+                        pass
+    else:
+        # OpenAI 格式：直接转发
+        buffer = ""
+        async with httpx.AsyncClient(timeout=300) as client:
+            async with client.stream("POST", _api_url, headers=headers, json=body) as response:
+                if response.status_code != 200:
+                    error_body = b""
+                    async for chunk in response.aiter_bytes():
+                        error_body += chunk
+                    print(f"❌ 流式请求失败 [{response.status_code}]: {error_body[:500].decode('utf-8', errors='ignore')}")
+                    err_msg = f"⚠️ 请求失败 ({response.status_code})"
+                    err_payload = json.dumps({'choices': [{'delta': {'content': err_msg}, 'finish_reason': None}], 'model': model}, ensure_ascii=False)
+                    yield f"data: {err_payload}\n\n".encode("utf-8")
+                    yield b"data: [DONE]\n\n"
+                    return
+
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+                    try:
+                        buffer += chunk.decode("utf-8", errors="ignore")
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+                            if line.startswith("data: ") and line != "data: [DONE]":
+                                try:
+                                    data = json.loads(line[6:])
+                                    delta = data.get("choices", [{}])[0].get("delta", {})
+
+                                    # 🔍 调试日志：记录第一个有效delta的所有字段
+                                    if not _logged_first_delta and delta:
+                                        keys = list(delta.keys())
+                                        if keys and keys != ['role']:
+                                            print(f"🔍 [流式调试] 首个delta字段: {keys}, 模型: {model}")
+                                            # 如果有思考链相关字段，打印示例
+                                            for k in ('reasoning_content', 'reasoning', 'reasoning_details'):
+                                                if k in delta:
+                                                    sample = str(delta[k])[:100]
+                                                    print(f"🔍 [流式调试] {k} 示例: {sample}")
+                                            _logged_first_delta = True
+
+                                    # 统计思考链 chunk 数
+                                    if delta.get('reasoning_content') or delta.get('reasoning') or delta.get('reasoning_details'):
+                                        _reasoning_chunks += 1
+
+                                    content = delta.get("content", "")
+                                    if content:
+                                        full_response.append(content)
+                                except (json.JSONDecodeError, KeyError, IndexError):
+                                    pass
+                    except Exception:
+                        pass
+
     assistant_msg = "".join(full_response)
     
     # 🔍 流式完成汇总
@@ -2384,7 +2469,7 @@ async def api_extract_now(request: Request):
         for mem in new_memories:
             if any(kw in mem["content"] for kw in META_BLACKLIST):
                 continue
-            is_dup, _ = await check_memory_duplicate(mem["content"], new_title=mem.get("title", ""))
+            is_dup, _ = await check_memory_duplicate(mem["content"], new_title=mem.get("title", ""), project_id=project_id)
             if is_dup:
                 skipped_count += 1
                 continue
@@ -2993,7 +3078,7 @@ async def api_create_provider(request: Request):
         if not api_base_url:
             return {"error": "API Base URL 不能为空"}
 
-        provider = await create_provider(name, api_base_url, api_key, enabled)
+        provider = await create_provider(name, api_base_url, api_key, enabled, api_format=data.get("api_format", "openai"))
         return {"status": "created", "provider": provider}
     except Exception as e:
         return {"error": str(e)}
